@@ -307,3 +307,113 @@ func TestCluster_MigrateSlot(t *testing.T) {
 	defer ticker.Stop()
 	<-ticker.C
 }
+
+// TestCluster_ReconcileForcePush drives the real reconcile path and asserts when it pushes. The
+// equal-epoch-but-diverged case is the regression guard: the previous epoch-only logic re-pushed only
+// when a node's version was strictly behind, so a node drifted at an equal epoch was never repaired.
+func TestCluster_ReconcileForcePush(t *testing.T) {
+	ctx := context.Background()
+	ns, clusterName := "test-ns", "reconcile"
+
+	newChecker := func() (*ClusterChecker, *store.Cluster, []*store.ClusterMockNode) {
+		s := NewMockClusterStore()
+		nodes := make([]*store.ClusterMockNode, 3)
+		for i := range nodes {
+			nodes[i] = store.NewClusterMockNode()
+			nodes[i].SetRole(store.RoleSlave)
+		}
+		nodes[0].SetRole(store.RoleMaster)
+		cluster := &store.Cluster{
+			Name: clusterName,
+			Shards: []*store.Shard{{
+				Nodes:            []store.Node{nodes[0], nodes[1], nodes[2]},
+				SlotRanges:       []store.SlotRange{{Start: 0, Stop: 16383}},
+				MigratingSlot:    &store.MigratingSlot{IsMigrating: false},
+				TargetShardIndex: -1,
+			}},
+		}
+		cluster.Version.Store(1)
+		require.NoError(t, s.CreateCluster(ctx, ns, cluster))
+		c := &ClusterChecker{
+			clusterStore:  s,
+			namespace:     ns,
+			clusterName:   clusterName,
+			options:       ClusterCheckOptions{pingInterval: time.Second, maxFailureCount: 3},
+			failureCounts: make(map[string]int64),
+			syncCh:        make(chan struct{}, 1),
+		}
+		return c, cluster, nodes
+	}
+
+	forcedPushes := func(nodes []*store.ClusterMockNode) int {
+		n := 0
+		for _, node := range nodes {
+			for _, force := range node.SyncForceCalls {
+				require.True(t, force, "reconcile must push with force=true")
+				n++
+			}
+		}
+		return n
+	}
+
+	t.Run("converged: no push", func(t *testing.T) {
+		c, cluster, nodes := newChecker()
+		for _, node := range nodes {
+			node.MockClusterInfo = &store.ClusterInfo{CurrentEpoch: 1, KnownNodes: 3, SlotsOk: 16384}
+		}
+		c.parallelProbeNodes(ctx, cluster)
+		require.Equal(t, 0, forcedPushes(nodes))
+	})
+
+	t.Run("equal epoch but incomplete coverage: force push (regression)", func(t *testing.T) {
+		c, cluster, nodes := newChecker()
+		for _, node := range nodes {
+			node.MockClusterInfo = &store.ClusterInfo{CurrentEpoch: 1, KnownNodes: 3, SlotsOk: 16000}
+		}
+		c.parallelProbeNodes(ctx, cluster)
+		require.Equal(t, 3, forcedPushes(nodes))
+	})
+
+	t.Run("equal epoch but wrong peer count: force push (regression)", func(t *testing.T) {
+		c, cluster, nodes := newChecker()
+		for _, node := range nodes {
+			node.MockClusterInfo = &store.ClusterInfo{CurrentEpoch: 1, KnownNodes: 2, SlotsOk: 16384}
+		}
+		c.parallelProbeNodes(ctx, cluster)
+		require.Equal(t, 3, forcedPushes(nodes))
+	})
+
+	t.Run("behind epoch: force push", func(t *testing.T) {
+		c, cluster, nodes := newChecker()
+		for _, node := range nodes {
+			node.MockClusterInfo = &store.ClusterInfo{CurrentEpoch: 0, KnownNodes: 3, SlotsOk: 16384}
+		}
+		c.parallelProbeNodes(ctx, cluster)
+		require.Equal(t, 3, forcedPushes(nodes))
+	})
+
+	t.Run("fields unreported at equal epoch: no push", func(t *testing.T) {
+		c, cluster, nodes := newChecker()
+		for _, node := range nodes {
+			node.MockClusterInfo = &store.ClusterInfo{CurrentEpoch: 1, KnownNodes: -1, SlotsOk: -1}
+		}
+		c.parallelProbeNodes(ctx, cluster)
+		require.Equal(t, 0, forcedPushes(nodes))
+	})
+}
+
+func TestTopologyDiverged(t *testing.T) {
+	const wantNodes, wantSlots = int64(6), int64(16384)
+
+	// Converged: peer count and coverage both match desired.
+	require.False(t, topologyDiverged(&store.ClusterInfo{KnownNodes: 6, SlotsOk: 16384}, wantNodes, wantSlots))
+	// Wrong peer count (e.g. a phantom or missing node).
+	require.True(t, topologyDiverged(&store.ClusterInfo{KnownNodes: 7, SlotsOk: 16384}, wantNodes, wantSlots))
+	// Incomplete coverage.
+	require.True(t, topologyDiverged(&store.ClusterInfo{KnownNodes: 6, SlotsOk: 16000}, wantNodes, wantSlots))
+	// Fields not reported (older kvrocks): fall back to epoch-only, never treated as diverged.
+	require.False(t, topologyDiverged(&store.ClusterInfo{KnownNodes: -1, SlotsOk: -1}, wantNodes, wantSlots))
+	require.False(t, topologyDiverged(nil, wantNodes, wantSlots))
+	// A cluster intentionally mid-scale (partial desired coverage) is converged when the node matches.
+	require.False(t, topologyDiverged(&store.ClusterInfo{KnownNodes: 6, SlotsOk: 8192}, wantNodes, 8192))
+}
