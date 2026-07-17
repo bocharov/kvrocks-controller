@@ -57,7 +57,7 @@ func TestClusterNode(t *testing.T) {
 		}}
 
 		cluster.Version.Store(1)
-		require.NoError(t, node0.SyncClusterInfo(ctx, cluster))
+		require.NoError(t, node0.SyncClusterInfo(ctx, cluster, true))
 		clusterInfo, err := node0.GetClusterInfo(ctx)
 		require.NoError(t, err)
 		require.EqualValues(t, 1, clusterInfo.CurrentEpoch)
@@ -103,4 +103,23 @@ func TestNodeInfo_Validate(t *testing.T) {
 	node.role = RoleMaster
 	node.addr = "1.2.3.4"
 	require.NoError(t, node.Validate())
+}
+
+func TestParseClusterInfo(t *testing.T) {
+	// Absent fields keep the -1 sentinel so a partial reply never looks converged.
+	info, err := parseClusterInfo("cluster_state:ok\r\ncluster_current_epoch:7\r\n")
+	require.NoError(t, err)
+	require.EqualValues(t, 7, info.CurrentEpoch)
+	require.EqualValues(t, -1, info.KnownNodes)
+	require.EqualValues(t, -1, info.SlotsOk)
+
+	info, err = parseClusterInfo("cluster_current_epoch:3\r\ncluster_known_nodes:6\r\ncluster_slots_ok:16384\r\n")
+	require.NoError(t, err)
+	require.EqualValues(t, 3, info.CurrentEpoch)
+	require.EqualValues(t, 6, info.KnownNodes)
+	require.EqualValues(t, 16384, info.SlotsOk)
+
+	// A malformed integer surfaces as an error rather than a silent zero.
+	_, err = parseClusterInfo("cluster_known_nodes:not-a-number\r\n")
+	require.Error(t, err)
 }

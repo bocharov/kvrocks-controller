@@ -24,9 +24,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
+	"sync"
+
 	"github.com/apache/kvrocks-controller/logger"
 	"go.uber.org/zap"
-	"sync"
 
 	"github.com/apache/kvrocks-controller/consts"
 	"github.com/apache/kvrocks-controller/store/engine"
@@ -274,6 +276,12 @@ func (s *ClusterStore) RemoveCluster(ctx context.Context, ns, cluster string) er
 func (s *ClusterStore) CheckNewNodes(ctx context.Context, nodes []string) error {
 	newNodes := make(map[string]bool, 0)
 	for _, node := range nodes {
+		// Reject a blank/half-formed address (e.g. ":6666" from an unresolved hostname) at the API
+		// boundary: it would otherwise serialize into a malformed CLUSTERX SETNODES line and register
+		// a phantom, unreachable node.
+		if host, port, err := net.SplitHostPort(node); err != nil || host == "" || port == "" {
+			return fmt.Errorf("%w: node address must be host:port, got %q", consts.ErrInvalidArgument, node)
+		}
 		newNodes[node] = true
 	}
 
