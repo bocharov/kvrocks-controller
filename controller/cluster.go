@@ -117,7 +117,7 @@ func (c *ClusterChecker) WithFailoverOptions(opts store.FailoverOptions) *Cluste
 	return c
 }
 
-func (c *ClusterChecker) probeNode(ctx context.Context, node store.Node) (int64, error) {
+func (c *ClusterChecker) probeNode(ctx context.Context, node store.Node) (*store.ClusterInfo, error) {
 	clusterInfo, err := node.GetClusterInfo(ctx)
 	if err != nil {
 		// We need to use the string contains to check the error message
@@ -125,14 +125,14 @@ func (c *ClusterChecker) probeNode(ctx context.Context, node store.Node) (int64,
 		// And it's fixed in PR: https://github.com/apache/kvrocks/pull/2362,
 		// but we need to be compatible with the old version here.
 		if strings.Contains(err.Error(), ErrRestoringBackUp.Error()) {
-			return -1, ErrRestoringBackUp
+			return nil, ErrRestoringBackUp
 		} else if strings.Contains(err.Error(), ErrClusterNotInitialized.Error()) {
-			return -1, ErrClusterNotInitialized
+			return nil, ErrClusterNotInitialized
 		} else {
-			return -1, err
+			return nil, err
 		}
 	}
-	return clusterInfo.CurrentEpoch, nil
+	return clusterInfo, nil
 }
 
 func (c *ClusterChecker) increaseFailureCount(shardIndex int, node store.Node) int64 {
@@ -230,8 +230,9 @@ func (c *ClusterChecker) syncClusterToNodes(ctx context.Context) error {
 					zap.Int64("version", version),
 					zap.String("node_id", n.ID()),
 					zap.String("addr", n.Addr()))
-				// sync the clusterName to the latest version
-				if err := n.SyncClusterInfo(ctx, clusterInfo); err != nil {
+				// sync the clusterName to the latest version; force so a drifted-but-equal-version
+				// node is actually repaired rather than no-op'd by the server's version gate.
+				if err := n.SyncClusterInfo(ctx, clusterInfo, true); err != nil {
 					log.Error("Failed to sync the cluster topology to the node", zap.Error(err))
 				} else {
 					log.Info("Succeed to sync the cluster topology to the node")
@@ -242,11 +243,37 @@ func (c *ClusterChecker) syncClusterToNodes(ctx context.Context) error {
 	return nil
 }
 
+// topologyDiverged reports whether a probed node's applied topology disagrees with the desired one:
+// a wrong peer count or wrong slot coverage. It returns false when the node did not report these
+// fields (KnownNodes/SlotsOk < 0), so an older kvrocks that omits them falls back to epoch-only
+// reconcile instead of being force-pushed on every tick.
+func topologyDiverged(info *store.ClusterInfo, wantNodes, wantSlots int64) bool {
+	if info == nil || info.KnownNodes < 0 || info.SlotsOk < 0 {
+		return false
+	}
+	return info.KnownNodes != wantNodes || info.SlotsOk != wantSlots
+}
+
 func (c *ClusterChecker) parallelProbeNodes(ctx context.Context, cluster *store.Cluster) {
 	var mu sync.Mutex
 	var latestNodeVersion int64 = 0
 	var latestClusterNodesStr string
 	var wg sync.WaitGroup
+
+	// Desired peer count and covered-slot count from the stored (authoritative) topology. Comparing a
+	// node's applied view against these detects drift at an equal epoch; using the DESIRED coverage
+	// (not a hardcoded 16384) avoids false drift while a cluster is intentionally mid-scale with some
+	// slots not yet assigned.
+	wantNodes := int64(0)
+	wantSlots := int64(0)
+	for _, shard := range cluster.Shards {
+		wantNodes += int64(len(shard.Nodes))
+		for _, sr := range shard.SlotRanges {
+			if sr.Start >= 0 && sr.Stop >= sr.Start {
+				wantSlots += int64(sr.Stop - sr.Start + 1)
+			}
+		}
+	}
 
 	for i, shard := range cluster.Shards {
 		for _, node := range shard.Nodes {
@@ -259,7 +286,7 @@ func (c *ClusterChecker) parallelProbeNodes(ctx context.Context, cluster *store.
 					zap.Bool("is_master", n.IsMaster()),
 					zap.String("addr", n.Addr()),
 				)
-				version, err := c.probeNode(ctx, n)
+				info, err := c.probeNode(ctx, n)
 				// Don't sync the cluster info to the node if it is restoring the db from backup
 				if errors.Is(err, ErrRestoringBackUp) {
 					log.Error("The node is restoring the db from backup")
@@ -274,10 +301,20 @@ func (c *ClusterChecker) parallelProbeNodes(ctx context.Context, cluster *store.
 				}
 				log.Debug("Probe the clusterName node")
 
+				// An uninitialized node (nil info) reports version -1, so the "behind" test below pushes it.
+				var version int64 = -1
+				if info != nil {
+					version = info.CurrentEpoch
+				}
+
 				clusterVersion := cluster.Version.Load()
-				if version < clusterVersion {
-					// sync the clusterName to the latest version
-					if err := n.SyncClusterInfo(ctx, cluster); err != nil {
+				// Push when the node is behind the store, OR when it matches the epoch but its applied
+				// topology has drifted (a dropped/partial push the epoch comparison alone cannot see —
+				// issue #395). Force so an equal-version repair is actually applied: the server no-ops an
+				// equal-version SETNODES otherwise. A forced push replaces the node's whole topology, so
+				// it also clears phantom/empty-address entries without a data-destroying CLUSTER RESET.
+				if version < clusterVersion || (version == clusterVersion && topologyDiverged(info, wantNodes, wantSlots)) {
+					if err := n.SyncClusterInfo(ctx, cluster, true); err != nil {
 						log.With(zap.Error(err)).Error("Failed to sync the clusterName info")
 					}
 				} else if version > clusterVersion {

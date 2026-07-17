@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -40,7 +41,6 @@ const (
 	// used to denote a non migrating slot
 	NotMigratingInt = -1
 )
-
 
 // FailoverOptions configures manual failover behavior.
 type FailoverOptions struct {
@@ -420,6 +420,12 @@ func (shard *Shard) ToSlotsString() (string, error) {
 	}
 
 	for i, node := range shard.Nodes {
+		// A blank host (":port") would emit a malformed line and register a phantom, unreachable node.
+		// Fail loudly here rather than push corruption to every kvrocks node.
+		host, port, err := net.SplitHostPort(node.Addr())
+		if err != nil || host == "" || port == "" {
+			return "", fmt.Errorf("node %s has invalid address %q", node.ID(), node.Addr())
+		}
 		builder.WriteString(node.ID())
 		builder.WriteByte(' ')
 		builder.WriteString(strings.Replace(node.Addr(), ":", " ", 1))
