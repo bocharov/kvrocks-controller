@@ -60,6 +60,12 @@ func CollectMetrics(c *gin.Context) {
 	}
 }
 
+// redirectedParam marks a request that has already been redirected to the leader once. It
+// travels in the redirect URL (not a header), so it survives the hop for any HTTP client and
+// lets a follower with a stale leadership view fail fast instead of bouncing the request
+// around the cluster forever.
+const redirectedParam = "kvctl_leader_redirected"
+
 func RedirectIfNotLeader(c *gin.Context) {
 	storage, _ := c.MustGet(consts.ContextKeyStore).(*store.ClusterStore)
 	if storage.Leader() == "" {
@@ -68,22 +74,34 @@ func RedirectIfNotLeader(c *gin.Context) {
 		return
 	}
 
+	// The raft engine forwards writes to the leader internally, so no HTTP redirect is needed.
 	_, isRaftMode := storage.GetEngine().(*raft.Node)
-	// Raft engine will forward the request to the leader node under the hood,
-	// so we don't need to do the redirect.
-	if !storage.IsLeader() && !isRaftMode {
-		if !c.GetBool(consts.HeaderIsRedirect) {
-			c.Set(consts.HeaderIsRedirect, true)
-			peerAddr := helper.ExtractAddrFromSessionID(storage.Leader())
-			c.Redirect(http.StatusTemporaryRedirect, "http://"+peerAddr+c.Request.RequestURI)
-			c.Redirect(http.StatusTemporaryRedirect, "http://"+storage.Leader()+c.Request.RequestURI)
-		} else {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "no leader now, please retry later"})
-			c.Abort()
-		}
+	if storage.IsLeader() || isRaftMode {
+		c.Next()
 		return
 	}
-	c.Next()
+
+	// This node is a follower, so it must NOT run the request's handlers. The c.Abort() below
+	// is essential: without it gin keeps executing the chain here, so a write (e.g. a shard
+	// failover) runs on the follower AND, once the client follows the 307, runs a second time
+	// on the leader — for failover that second run can re-promote the node that was just
+	// demoted. So we redirect to the leader and stop.
+	if c.Query(redirectedParam) != "" {
+		// Already redirected once and still not the leader (leadership moved mid-request).
+		// Don't redirect again; let the client retry against a freshly resolved leader.
+		c.JSON(http.StatusBadRequest, gin.H{"error": "leader changed during redirect, please retry"})
+		c.Abort()
+		return
+	}
+	// Redirect to the leader's own address (not the load-balanced service, which could land on
+	// another follower). 307 preserves the request method and body.
+	leaderAddr := helper.ExtractAddrFromSessionID(storage.Leader())
+	sep := "?"
+	if c.Request.URL.RawQuery != "" {
+		sep = "&"
+	}
+	c.Redirect(http.StatusTemporaryRedirect, "http://"+leaderAddr+c.Request.RequestURI+sep+redirectedParam+"=1")
+	c.Abort()
 }
 
 func RequiredNamespace(c *gin.Context) {
