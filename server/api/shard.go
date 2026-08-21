@@ -133,6 +133,7 @@ func (handler *ShardHandler) Failover(c *gin.Context) {
 
 	var req struct {
 		PreferredNodeID string        `json:"preferred_node_id"`
+		CurrentMasterID string        `json:"current_master_id"`
 		Options         *FailoverOpts `json:"options"`
 	}
 	if c.Request.Body != nil {
@@ -143,6 +144,10 @@ func (handler *ShardHandler) Failover(c *gin.Context) {
 	}
 	if len(req.PreferredNodeID) > 0 && len(req.PreferredNodeID) != store.NodeIDLen {
 		helper.ResponseBadRequest(c, fmt.Errorf("invalid node id: %s", req.PreferredNodeID))
+		return
+	}
+	if len(req.CurrentMasterID) > 0 && len(req.CurrentMasterID) != store.NodeIDLen {
+		helper.ResponseBadRequest(c, fmt.Errorf("invalid current master node id: %s", req.CurrentMasterID))
 		return
 	}
 
@@ -167,8 +172,17 @@ func (handler *ShardHandler) Failover(c *gin.Context) {
 		helper.ResponseBadRequest(c, err)
 		return
 	}
-	oldMaster, newMaster, err := cluster.PromoteNewMaster(c, shardIndex, "", req.PreferredNodeID, opts)
+	oldMaster, newMaster, err := cluster.PromoteNewMaster(c, shardIndex, req.CurrentMasterID, req.PreferredNodeID, opts)
 	if err != nil {
+		// Idempotent failover: when the caller names the master it expects to demote
+		// (current_master_id) and that node is no longer the shard's master, the failover it
+		// asked for has already happened — a retry, or a duplicate request during a drain of a
+		// node that hosts several masters. Report success instead of promoting whoever is
+		// master now, which could hand the role back to a node that is itself departing.
+		if req.CurrentMasterID != "" && errors.Is(err, consts.ErrNodeIsNotMaster) {
+			helper.ResponseOK(c, gin.H{"new_master_id": "", "promoted": false})
+			return
+		}
 		helper.ResponseError(c, err)
 		return
 	}
@@ -205,5 +219,5 @@ func (handler *ShardHandler) Failover(c *gin.Context) {
 	wg.Wait()
 
 	unpauseOldMaster()
-	helper.ResponseOK(c, gin.H{"new_master_id": newMaster.ID()})
+	helper.ResponseOK(c, gin.H{"new_master_id": newMaster.ID(), "promoted": true})
 }
